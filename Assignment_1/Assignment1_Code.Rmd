@@ -1,0 +1,542 @@
+---
+title: "Assignment 1: Tuning a Neural Network for IMDB Review Classification"
+subtitle: "Advanced Machine Learning (64061) | Code, Output and Graphs"
+author: "Shujath Ali Ansari Mohammed"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: show
+  word_document:
+    toc: true
+    number_sections: true
+params:
+  rerun: false      # TRUE = retrain every model even if saved results exist
+  n_seeds: 3        # random seeds per configuration (1 = about 3x faster draft run)
+  epochs: 20        # maximum epochs per model (same as the class example)
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 9, fig.height = 4.2,
+                      dpi = 150)
+```
+
+# Objective
+
+The class example classifies IMDB movie reviews as positive or negative with a small fully-connected network (two hidden `Dense(16, relu)` layers, a sigmoid output, binary cross-entropy loss and RMSprop). In this assignment I change that network **one design choice at a time** to see how each choice affects validation and test accuracy, and then combine what I learned into a final model.
+
+Questions addressed:
+
+1. Does using **one or three hidden layers** instead of two help?
+2. Do **more or fewer hidden units** (8, 16, 32, 64, 128) help?
+3. What happens with **mse loss** instead of binary cross-entropy?
+4. What happens with **tanh activation** instead of relu?
+5. Can **regularization** from class (L2 weight decay, dropout) reduce overfitting and raise validation accuracy?
+
+# Setup
+
+```{r python-setup, include = FALSE}
+# Machine-specific Python setup. It runs when knitting but is hidden from the output.
+# Makes R use reticulate's own managed Python (with TensorFlow, Keras and NumPy)
+# instead of whatever other Python is installed on this Mac.
+Sys.unsetenv(c("RETICULATE_PYTHON", "RETICULATE_PYTHON_ENV", "RETICULATE_PYTHON_FALLBACK"))
+Sys.setenv(RETICULATE_USE_MANAGED_VENV = "yes")
+if (packageVersion("reticulate") < "1.41")
+  stop("Please update reticulate first: install.packages('reticulate'), then restart R.")
+if ("keras" %in% loadedNamespaces()) try(unloadNamespace("keras"), silent = TRUE)
+
+library(keras3)
+reticulate::py_require(c("tensorflow", "keras", "numpy"))
+invisible(op_convert_to_tensor(0))                # start Python now, through keras3
+```
+
+```{r libraries}
+library(keras3)      # Keras 3 for R (TensorFlow backend)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+
+np       <- reticulate::import("numpy", convert = FALSE)
+builtins <- reticulate::import_builtins()
+
+SEEDS     <- c(123, 456, 789, 1011, 2024)[seq_len(params$n_seeds)]
+EPOCHS    <- params$epochs
+BATCH     <- 512
+NUM_WORDS <- 10000
+
+dir.create("results", showWarnings = FALSE)
+RESULTS_FILE <- file.path("results", "experiment_results.rds")
+```
+
+# Data
+
+## Load IMDB
+
+Keras provides 50,000 reviews, already split into 25,000 training and 25,000 test reviews. Each review is a list of word IDs; only the 10,000 most frequent words are kept.
+
+```{r load-data}
+imdb <- dataset_imdb(num_words = NUM_WORDS)
+c(c(train_data, train_labels), c(test_data, test_labels)) %<-% imdb
+
+cat("Training reviews:", length(train_data), "\n")
+cat("Test reviews:    ", length(test_data), "\n")
+cat("Share positive (train / test):", mean(train_labels), "/", mean(test_labels), "\n")
+str(train_data[[1]][1:15])   # first 15 word IDs of the first review
+```
+
+## Describe the data
+
+```{r data-facts}
+review_len <- lengths(c(train_data, test_data))
+
+# Decode the first training review into words (illustration only).
+# Word IDs are offset by 3 (0 = padding, 1 = start, 2 = unknown word).
+example_review <- tryCatch({
+  word_index    <- dataset_imdb_word_index()
+  reverse_index <- setNames(names(word_index), unlist(word_index))
+  words <- sapply(train_data[[1]], function(i)
+    if (i > 3) reverse_index[[as.character(i - 3)]] else "?")
+  paste(head(words[-1], 45), collapse = " ")
+}, error = function(e) NA_character_)
+
+data_facts <- list(
+  n_train_total = length(train_data),
+  n_test        = length(test_data),
+  n_val         = 10000,
+  len_quartiles = quantile(review_len, c(0.25, 0.5, 0.75)),
+  pos_train     = mean(train_labels[10001:length(train_labels)]),
+  pos_val       = mean(train_labels[1:10000]),
+  pos_test      = mean(test_labels),
+  example_review = example_review,
+  example_label  = ifelse(train_labels[1] == 1, "positive", "negative"))
+
+summary(review_len)
+example_review
+```
+
+```{r review-length-plot, fig.height = 3.5}
+ggplot(data.frame(words = review_len), aes(words)) +
+  geom_histogram(bins = 60, fill = "#2a78d6", colour = "white") +
+  coord_cartesian(xlim = c(0, 1200)) +
+  labs(title = "Review length (words) across all 50,000 reviews",
+       x = "Words per review", y = "Number of reviews") +
+  theme_minimal(base_size = 12)
+```
+
+## Multi-hot encoding
+
+Each review becomes one row of 10,000 columns: 1 if the word appears in the review, 0 if not (word presence, not order). The matrix is built directly as a 32-bit NumPy array. That uses half the memory of an R matrix of doubles, and TensorFlow receives the data once instead of once per model.
+
+```{r vectorize}
+vectorize_sequences <- function(sequences, dimension = NUM_WORDS) {
+  rows <- rep(seq_along(sequences), lengths(sequences)) - 1L   # review number (0-based)
+  cols <- as.integer(unlist(sequences))                        # word ID of each word
+  results <- np$zeros(c(length(sequences), as.integer(dimension)), dtype = "float32")
+  results$`__setitem__`(reticulate::tuple(np$array(rows), np$array(cols)), 1)
+  results
+}
+
+x_train_all <- vectorize_sequences(train_data)
+x_test      <- vectorize_sequences(test_data)
+y_train     <- as.numeric(train_labels)
+y_test      <- as.numeric(test_labels)
+
+data_facts$matrix_shape <- unlist(reticulate::py_to_r(x_train_all$shape))
+data_facts$matrix_shape                                       # rows x columns
+
+# Check: number of 1s in the first row = number of distinct words in review 1
+c(ones_in_row_1 = reticulate::py_to_r(x_train_all$`__getitem__`(0L)$sum()),
+  distinct_words = length(unique(train_data[[1]])))
+```
+
+## Validation split
+
+As in class, the first 10,000 training reviews form the validation set; the remaining 15,000 are used for training. The test set is only used for final reporting, never for choosing a model.
+
+```{r split}
+x_val           <- x_train_all$`__getitem__`(builtins$slice(0L, 10000L))
+partial_x_train <- x_train_all$`__getitem__`(builtins$slice(10000L, 25000L))
+y_val           <- y_train[1:10000]
+partial_y_train <- y_train[10001:25000]
+
+cat("Training:", length(partial_y_train), "| Validation:", length(y_val),
+    "| Test:", length(y_test), "\n")
+```
+
+# Model functions
+
+One function builds any variant of the network and one function trains and scores it, so every experiment runs through the same code and only the intended factor changes.
+
+```{r functions}
+# Build a network with n_layers hidden Dense layers, optional L2 penalty and dropout
+build_model <- function(n_layers = 2, units = 16, activation = "relu",
+                        l2 = 0, dropout = 0) {
+  model <- keras_model_sequential(input_shape = NUM_WORDS)
+  for (i in seq_len(n_layers)) {
+    model |> layer_dense(
+      units = units, activation = activation,
+      kernel_regularizer = if (l2 > 0) keras3::regularizer_l2(l2 = l2) else NULL)
+    if (dropout > 0) model |> layer_dropout(rate = dropout)
+  }
+  model |> layer_dense(units = 1, activation = "sigmoid")
+  model
+}
+
+# Train one configuration with one seed and keep the weights from the best validation epoch
+run_once <- function(cfg, seed) {
+  set_random_seed(seed)                        # seeds R, Python, NumPy and TensorFlow
+  model <- build_model(cfg$n_layers, cfg$units, cfg$activation, cfg$l2, cfg$dropout)
+  model |> compile(optimizer = optimizer_rmsprop(), loss = cfg$loss,
+                   metrics = list(metric_binary_accuracy(name = "accuracy")))
+
+  ckpt <- tempfile(fileext = ".weights.h5")
+  history <- model |> fit(
+    partial_x_train, partial_y_train,
+    epochs = EPOCHS, batch_size = BATCH,
+    validation_data = list(x_val, y_val), verbose = 0,
+    callbacks = list(callback_model_checkpoint(
+      ckpt, monitor = "val_accuracy", mode = "max",
+      save_best_only = TRUE, save_weights_only = TRUE)))
+
+  load_model_weights(model, ckpt)              # restore the best-validation-epoch weights
+  test_scores <- model |> evaluate(x_test, y_test, verbose = 0)
+  unlink(ckpt)
+
+  m <- history$metrics
+  list(
+    summary = tibble(config = cfg$config, seed = seed,
+                     best_val_acc = max(m$val_accuracy),
+                     best_epoch   = which.max(m$val_accuracy),
+                     min_val_loss = min(m$val_loss),
+                     test_acc     = test_scores$accuracy),
+    curves = tibble(config = cfg$config, seed = seed, epoch = seq_along(m$loss),
+                    loss = m$loss, val_loss = m$val_loss,
+                    accuracy = m$accuracy, val_accuracy = m$val_accuracy))
+}
+```
+
+# Experiment design
+
+Each configuration differs from the class baseline in **one** factor, except group F, which combines the most promising ideas. Controls held constant in every run: same data and split, RMSprop with the default learning rate, batch size 512, up to 20 epochs, 3 random seeds per configuration, and a checkpoint that keeps the epoch with the best validation accuracy (so models that overfit at different speeds are compared fairly).
+
+```{r configs}
+cfg <- function(config, group, n_layers = 2, units = 16, activation = "relu",
+                loss = "binary_crossentropy", l2 = 0, dropout = 0)
+  tibble(config, group, n_layers, units, activation, loss, l2, dropout)
+
+configs <- bind_rows(
+  cfg("Baseline (2x16 relu, BCE)", "Baseline"),
+  cfg("1 hidden layer",            "A. Depth", n_layers = 1),
+  cfg("3 hidden layers",           "A. Depth", n_layers = 3),
+  cfg("8 units",                   "B. Width", units = 8),
+  cfg("32 units",                  "B. Width", units = 32),
+  cfg("64 units",                  "B. Width", units = 64),
+  cfg("128 units",                 "B. Width", units = 128),
+  cfg("MSE loss",                  "C. Loss", loss = "mse"),
+  cfg("tanh activation",           "D. Activation", activation = "tanh"),
+  cfg("L2 = 0.001",                "E. Regularization", l2 = 0.001),
+  cfg("L2 = 0.0001",               "E. Regularization", l2 = 0.0001),
+  cfg("Dropout 0.3",               "E. Regularization", dropout = 0.3),
+  cfg("Dropout 0.5",               "E. Regularization", dropout = 0.5),
+  cfg("L2 0.0001 + dropout 0.5",   "E. Regularization", l2 = 0.0001, dropout = 0.5),
+  cfg("32 units + dropout 0.5",           "F. Combined", units = 32, dropout = 0.5),
+  cfg("64 units + dropout 0.5",           "F. Combined", units = 64, dropout = 0.5),
+  cfg("32 units + dropout 0.5 + L2 1e-4", "F. Combined", units = 32, dropout = 0.5, l2 = 0.0001),
+  cfg("64 units + dropout 0.5 + L2 1e-4", "F. Combined", units = 64, dropout = 0.5, l2 = 0.0001)
+)
+kable(configs, caption = "All configurations")
+```
+
+# Train all models
+
+`r nrow(configs)` configurations x `r length(SEEDS)` seeds. Progress is printed in the RStudio *Render* pane. If saved results with the same settings exist, they are reused. Set `rerun: true` in the header to retrain.
+
+```{r train}
+saved_ok <- file.exists(RESULTS_FILE) && !params$rerun && {
+  saved <- readRDS(RESULTS_FILE)
+  identical(saved$seeds, SEEDS) && identical(saved$epochs, EPOCHS) &&
+    all(configs$config %in% saved$runs$config)
+}
+
+if (saved_ok) {
+  runs <- saved$runs; curves <- saved$curves
+  cat("Loaded saved results from", RESULTS_FILE, "\n")
+} else {
+  out <- list()
+  for (i in seq_len(nrow(configs))) {
+    for (s in SEEDS) {
+      message(sprintf("[%s] %s | seed %d", format(Sys.time(), "%H:%M:%S"),
+                      configs$config[i], s))
+      out[[length(out) + 1]] <- run_once(configs[i, ], s)
+    }
+  }
+  runs   <- bind_rows(lapply(out, `[[`, "summary"))
+  curves <- bind_rows(lapply(out, `[[`, "curves"))
+}
+```
+
+# Results
+
+## Summarise across seeds
+
+Mean and standard deviation of best validation accuracy across seeds, and the change compared with the baseline in percentage points (pp).
+
+```{r summarise}
+results <- runs |>
+  filter(config %in% configs$config) |>
+  group_by(config) |>
+  summarise(val_acc = mean(best_val_acc), val_sd = sd(best_val_acc),
+            test_acc = mean(test_acc), best_epoch = median(best_epoch),
+            min_val_loss = mean(min_val_loss), .groups = "drop") |>
+  mutate(val_sd = ifelse(is.na(val_sd), 0, val_sd)) |>
+  inner_join(configs, by = "config")
+
+base    <- filter(results, group == "Baseline")
+results <- mutate(results, delta_vs_base = val_acc - base$val_acc)
+base_name <- base$config
+
+# Differences smaller than this are treated as run-to-run noise (at least 0.2 pp)
+NOISE <- max(0.002, 2 * mean(results$val_sd))
+cat(sprintf("Noise threshold: %.2f pp\n", 100 * NOISE))
+
+# Helpers for tables and plots
+pct <- function(x) sprintf("%.2f%%", 100 * x)
+pp  <- function(x) sprintf("%+.2f pp", 100 * x)
+
+show_table <- function(df, caption) {
+  df |>
+    arrange(desc(val_acc)) |>
+    transmute(Configuration = config,
+              `Val acc (mean)` = pct(val_acc),
+              `± SD` = sprintf("%.2f", 100 * val_sd),
+              `Δ vs baseline` = pp(delta_vs_base),
+              `Best epoch` = best_epoch,
+              `Min val loss` = sprintf("%.3f", min_val_loss),
+              `Test acc` = pct(test_acc)) |>
+    kable(caption = caption, align = "lrrrrrr")
+}
+
+plot_curves <- function(cfg_names, metric = c("loss", "accuracy"), title = NULL) {
+  metric <- match.arg(metric)
+  curves |>
+    filter(config %in% cfg_names) |>
+    group_by(config, epoch) |>
+    summarise(Training = mean(.data[[metric]]),
+              Validation = mean(.data[[paste0("val_", metric)]]), .groups = "drop") |>
+    pivot_longer(c(Training, Validation), names_to = "split", values_to = "value") |>
+    mutate(config = factor(config, levels = cfg_names)) |>
+    ggplot(aes(epoch, value, colour = split)) +
+    geom_line(linewidth = 0.9) + geom_point(size = 1.4) +
+    facet_wrap(~config) +
+    scale_colour_manual(values = c(Training = "#2a78d6", Validation = "#F28CB1")) +
+    labs(title = title, x = "Epoch", y = tools::toTitleCase(metric), colour = NULL) +
+    theme_minimal(base_size = 12) + theme(legend.position = "top")
+}
+```
+
+## Baseline: the model from class
+
+```{r baseline-plots}
+plot_curves(base_name, "loss", "Baseline: training vs validation loss (mean over seeds)")
+plot_curves(base_name, "accuracy", "Baseline: training vs validation accuracy")
+```
+
+Training loss keeps falling for all 20 epochs while validation loss bottoms out after about `r round(base$best_epoch)` epochs and then climbs: the classic sign of overfitting. Baseline best validation accuracy: **`r pct(base$val_acc)`**.
+
+## A. Number of hidden layers
+
+```{r depth}
+show_table(filter(results, group %in% c("Baseline", "A. Depth")),
+           "Effect of depth (16 units per layer)")
+```
+
+## B. Number of hidden units
+
+```{r width}
+width <- filter(results, group %in% c("Baseline", "B. Width"))
+show_table(width, "Effect of width (2 hidden layers)")
+
+width |>
+  ggplot(aes(units, val_acc)) +
+  geom_line(colour = "#2a78d6", linewidth = 0.9) +
+  geom_errorbar(aes(ymin = val_acc - val_sd, ymax = val_acc + val_sd),
+                width = 0.08, colour = "#2a78d6") +
+  geom_point(size = 3, colour = "#2a78d6") +
+  scale_x_continuous(trans = "log2", breaks = c(8, 16, 32, 64, 128)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(title = "Validation accuracy vs units per layer (mean +/- 1 SD)",
+       x = "Units per hidden layer (log scale)", y = "Best validation accuracy") +
+  theme_minimal(base_size = 12)
+
+width_names <- c("8 units", base_name, "64 units", "128 units")
+curves |>
+  filter(config %in% width_names) |>
+  group_by(config, epoch) |> summarise(val_loss = mean(val_loss), .groups = "drop") |>
+  mutate(config = factor(config, levels = width_names)) |>
+  ggplot(aes(epoch, val_loss, colour = config)) + geom_line(linewidth = 0.9) +
+  scale_colour_manual(values = c("#2a78d6", "#52514e", "#F28CB1", "#e34948")) +
+  labs(title = "Validation loss by width: bigger networks overfit sooner and harder",
+       x = "Epoch", y = "Validation loss", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "top")
+```
+
+## C. Loss function: mse vs binary cross-entropy
+
+```{r loss}
+show_table(filter(results, group %in% c("Baseline", "C. Loss")),
+           "Effect of the loss function")
+```
+
+Note: the "Min val loss" column is not comparable across these two rows, because mse and cross-entropy are on different scales.
+
+## D. Activation: tanh vs relu
+
+```{r activation}
+show_table(filter(results, group %in% c("Baseline", "D. Activation")),
+           "Effect of the hidden-layer activation")
+plot_curves(c(base_name, "tanh activation"), "loss", "Loss curves: relu (baseline) vs tanh")
+```
+
+## E. Regularization: L2 and dropout
+
+```{r regularization}
+show_table(filter(results, group %in% c("Baseline", "E. Regularization")),
+           "Effect of regularization (2 x 16 relu)")
+
+reg_names <- c(base_name, "L2 = 0.001", "Dropout 0.5", "L2 0.0001 + dropout 0.5")
+curves |>
+  filter(config %in% reg_names) |>
+  group_by(config, epoch) |> summarise(val_loss = mean(val_loss), .groups = "drop") |>
+  mutate(config = factor(config, levels = reg_names)) |>
+  ggplot(aes(epoch, val_loss, colour = config)) +
+  geom_line(linewidth = 0.9) + geom_point(size = 1.3) +
+  scale_colour_manual(values = c("#52514e", "#2a78d6", "#F28CB1", "#1baf7a")) +
+  labs(title = "Validation loss: regularization flattens the overfitting curve",
+       x = "Epoch", y = "Validation loss", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(legend.position = "top")
+```
+
+## F. Combined candidates
+
+```{r combined}
+show_table(filter(results, group %in% c("Baseline", "F. Combined")),
+           "Combined candidates (chosen on validation accuracy)")
+```
+
+# Final model: retrain on all training data and test once
+
+The final model is the configuration with the highest mean validation accuracy across the whole study (the test set is not used for this choice). It is retrained from scratch on all 25,000 training reviews for its best number of epochs, then evaluated once on the test set. The baseline gets the same treatment for comparison.
+
+```{r final}
+final     <- results |> slice_max(val_acc, n = 1, with_ties = FALSE)
+final_cfg <- filter(configs, config == final$config)
+base_cfg  <- filter(configs, config == base_name)
+cat("Selected final model:", final$config, "\n")
+cat(sprintf("Validation accuracy: %s vs baseline %s (%s)\n",
+            pct(final$val_acc), pct(base$val_acc), pp(final$delta_vs_base)))
+
+train_full <- function(cfg, epochs, seed) {
+  set_random_seed(seed)
+  model <- build_model(cfg$n_layers, cfg$units, cfg$activation, cfg$l2, cfg$dropout)
+  model |> compile(optimizer = optimizer_rmsprop(), loss = cfg$loss,
+                   metrics = list(metric_binary_accuracy(name = "accuracy")))
+  model |> fit(x_train_all, y_train, epochs = epochs, batch_size = BATCH, verbose = 0)
+  model |> evaluate(x_test, y_test, verbose = 0)
+}
+
+if (saved_ok && !is.null(saved$final_full) &&
+    identical(saved$final_full$final_config, final$config)) {
+  final_full <- saved$final_full
+} else {
+  rows <- list()
+  for (s in SEEDS) {
+    fb <- train_full(base_cfg,  max(1, round(base$best_epoch)),  s)
+    ff <- train_full(final_cfg, max(1, round(final$best_epoch)), s)
+    rows[[length(rows) + 1]] <- tibble(seed = s, baseline = fb$accuracy, final = ff$accuracy)
+  }
+  final_full <- list(final_config = final$config, table = bind_rows(rows))
+}
+
+ft <- final_full$table
+kable(ft, digits = 4, caption = "Test accuracy per seed after retraining on all 25,000 training reviews")
+
+tibble(Model = c(paste0("Baseline (", round(base$best_epoch), " epochs)"),
+                 paste0("Final: ", final$config, " (", round(final$best_epoch), " epochs)")),
+       `Test accuracy (mean)` = pct(c(mean(ft$baseline), mean(ft$final))),
+       `± SD` = sprintf("%.2f", 100 * c(sd(ft$baseline), sd(ft$final)))) |>
+  kable(caption = "Test accuracy after retraining (mean over seeds)")
+```
+
+```{r final-plots}
+plot_curves(c(base_name, final$config), "accuracy", "Baseline vs final model: accuracy by epoch")
+plot_curves(c(base_name, final$config), "loss", "Baseline vs final model: loss by epoch")
+```
+
+# Summary of all experiments
+
+```{r summary-plot, fig.width = 10, fig.height = 8}
+group_order <- c("Baseline", "A. Depth", "B. Width", "C. Loss", "D. Activation",
+                 "E. Regularization", "F. Combined")
+plot_df <- results |>
+  mutate(group = factor(group, levels = group_order),
+         is_final = config == final$config,
+         config = reorder(config, val_acc))
+
+ggplot(plot_df, aes(val_acc, config)) +
+  geom_vline(xintercept = base$val_acc, linetype = "dashed", colour = "#52514e") +
+  geom_errorbar(aes(xmin = val_acc - val_sd, xmax = val_acc + val_sd), orientation = "y",
+                width = 0, colour = "#86b6ef", linewidth = 1.2) +
+  geom_point(aes(colour = is_final), size = 3.2) +
+  geom_text(aes(label = pp(delta_vs_base)), nudge_y = 0.38, size = 3, colour = "#52514e") +
+  facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+  scale_colour_manual(values = c(`FALSE` = "#2a78d6", `TRUE` = "#F28CB1"),
+                      labels = c("Configuration", "Selected final model"), name = NULL) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(title = "Best validation accuracy for every configuration (mean +/- 1 SD across seeds)",
+       subtitle = "Dashed line = baseline from class. Labels = change vs baseline in percentage points.",
+       x = "Validation accuracy", y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top", strip.text.y = element_text(angle = 0, face = "bold"),
+        panel.grid.major.y = element_blank())
+```
+
+```{r full-table}
+results |>
+  mutate(group = factor(group, levels = group_order)) |>
+  arrange(group, desc(val_acc)) |>
+  transmute(Experiment = group, Configuration = config,
+            `Val acc` = pct(val_acc), `± SD` = sprintf("%.2f", 100 * val_sd),
+            `Δ vs baseline` = pp(delta_vs_base), `Best epoch` = best_epoch,
+            `Min val loss` = sprintf("%.3f", min_val_loss), `Test acc` = pct(test_acc)) |>
+  kable(caption = "Full results table (validation used for all decisions; test shown for reference only)",
+        align = "llrrrrrr")
+```
+
+# Conclusions
+
+* **Depth, loss and activation barely matter** on this problem. One or three hidden layers, mse loss and tanh activation all stayed within the run-to-run noise (about `r sprintf("%.2f", 100 * NOISE)` pp) of the baseline. A multi-hot bag of words is close to linearly separable, so a small network already captures most of the signal.
+* **Width helps a little, then hurts.** 32 units per layer was the best single change; 128 units was among the worst, because the extra capacity is spent memorising the training set (validation loss rises sooner and faster).
+* **Regularization flattens the overfitting curve.** Dropout and L2 keep validation loss much lower in later epochs and move the best epoch later, so the model is less sensitive to exactly when training stops, even though the peak accuracy gain on a 2 x 16 network is modest.
+* **Final model:** `r final$config`, with `r pct(final$val_acc)` validation accuracy (`r pp(final$delta_vs_base)` vs baseline). After retraining on all 25,000 training reviews it scored `r pct(mean(ft$final))` on the untouched test set vs `r pct(mean(ft$baseline))` for the baseline.
+* **Recommended defaults** for this kind of problem: relu hidden layers, a sigmoid output with binary cross-entropy, a moderately wide network, dropout / L2 to control overfitting, and a checkpoint or early stopping on validation accuracy. The ceiling of about 89% comes from the bag-of-words input; sequence models (embeddings, RNNs, Transformers) are the next step.
+
+# Save results
+
+```{r save}
+saveRDS(list(seeds = SEEDS, epochs = EPOCHS, configs = configs,
+             runs = runs, curves = curves, final_full = final_full,
+             data_facts = data_facts),
+        RESULTS_FILE)
+cat("Saved:", normalizePath(RESULTS_FILE), "\n")
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
