@@ -1,0 +1,17 @@
+approach,question,n_train,epochs_run,val_acc,test_acc,minutes,group
+Scratch,Q3 sweep,500,30,0.56,0.55,0.5,From scratch
+Scratch,Q1,1000,54,0.792,0.734,1.5,From scratch
+Scratch,Q3 sweep,2000,59,0.814,0.802,2.7,From scratch
+Scratch,Q2,5000,50,0.88,0.886,5.2,From scratch
+Scratch,Q3 sweep,10000,40,0.93,0.93,8.1,From scratch
+Scratch,Q3 sweep,20000,30,0.952,0.934,11.8,From scratch
+Pretrained: feature extraction,Q3 sweep,500,9,0.976,0.96,0.5,Pretrained VGG16
+Pretrained: feature extraction,Q1,1000,15,0.986,0.96,1.3,Pretrained VGG16
+Pretrained: feature extraction,Q3 sweep,2000,11,0.99,0.964,1.4,Pretrained VGG16
+Pretrained: feature extraction,Q2,5000,13,0.988,0.968,3.6,Pretrained VGG16
+Pretrained: feature extraction,Q3 sweep,10000,12,0.992,0.974,6.3,Pretrained VGG16
+Pretrained: fine-tuned,Q3 sweep,500,8,0.984,0.968,0.5,Pretrained VGG16
+Pretrained: fine-tuned,Q1,1000,10,0.994,0.966,0.9,Pretrained VGG16
+Pretrained: fine-tuned,Q3 sweep,2000,8,0.992,0.974,1.2,Pretrained VGG16
+Pretrained: fine-tuned,Q2,5000,7,0.99,0.964,2.3,Pretrained VGG16
+Pretrained: fine-tuned,Q3 sweep,10000,7,0.992,0.976,4.3,Pretrained VGG16
